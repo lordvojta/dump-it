@@ -3,14 +3,19 @@ use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::fs;
 use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
-type SitemapResult<'a> = Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, Box<dyn std::error::Error>>> + 'a>>;
+type SitemapResult<'a> = Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<String>, Box<dyn std::error::Error>>> + 'a>,
+>;
 
 #[derive(Parser)]
 #[command(name = "dump-it")]
@@ -41,12 +46,50 @@ struct Args {
     max_pages: usize,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct FormField {
+    field_type: String,
+    name: String,
+    label: String,
+    placeholder: String,
+    required: bool,
+    options: Vec<String>, // for select/radio/checkbox
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum ContentBlock {
+    Heading {
+        level: u8,
+        text: String,
+    },
+    Paragraph {
+        text: String,
+    },
+    Image {
+        original_url: String,
+        local_path: String,
+        alt_text: String,
+    },
+    List {
+        items: Vec<String>,
+    },
+    Form {
+        action: String,
+        method: String,
+        fields: Vec<FormField>,
+        submit_text: String,
+    },
+}
+
 #[derive(Serialize, Deserialize)]
 struct PageData {
     url: String,
     title: String,
-    content: String,
-    word_count: usize,
+    meta_title: String,
+    meta_description: String,
+    content_blocks: Vec<ContentBlock>,
+    total_words: usize,
 }
 
 #[derive(Serialize)]
@@ -105,7 +148,315 @@ impl Scraper {
         })
     }
 
-    async fn scrape_page(&self, url: String) -> Option<PageData> {
+    async fn download_image(&self, img_url: &str, output_dir: &str) -> Option<String> {
+        // Filter out tracking pixels and unwanted images
+        let lower_url = img_url.to_lowercase();
+        let tracking_domains = [
+            "googletagmanager",
+            "google-analytics",
+            "facebook.com/tr",
+            "doubleclick",
+            "analytics",
+            "tracking",
+            "pixel",
+            "beacon",
+        ];
+
+        for domain in &tracking_domains {
+            if lower_url.contains(domain) {
+                return None;
+            }
+        }
+
+        // Create hash-based filename from URL
+        let mut hasher = Sha256::new();
+        hasher.update(img_url.as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+
+        // Get file extension from URL
+        let extension = img_url
+            .split('?')
+            .next()?
+            .split('.')
+            .last()
+            .unwrap_or("jpg");
+
+        let filename = format!("{}.{}", &hash[..16], extension);
+        let filepath = format!("{}/{}", output_dir, filename);
+
+        // Check if already downloaded
+        if Path::new(&filepath).exists() {
+            return Some(filepath);
+        }
+
+        // Download image
+        match self.client.get(img_url).send().await {
+            Ok(response) if response.status().is_success() => {
+                if let Ok(bytes) = response.bytes().await {
+                    // Skip very small images (< 1KB, likely tracking pixels)
+                    if bytes.len() < 1024 {
+                        return None;
+                    }
+                    if fs::write(&filepath, &bytes).await.is_ok() {
+                        return Some(filepath);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        None
+    }
+
+    async fn extract_content_blocks(
+        &self,
+        doc: &Html,
+        page_url: &Url,
+        output_dir: &str,
+    ) -> Vec<ContentBlock> {
+        let mut blocks = Vec::new();
+        let mut seen_image_urls = HashSet::new();
+
+        // Select main content area
+        let main_selectors = ["main", "article", "[role='main']", "body"];
+        let mut content_root = None;
+
+        for selector_str in &main_selectors {
+            if let Ok(selector) = Selector::parse(selector_str) {
+                if let Some(element) = doc.select(&selector).next() {
+                    content_root = Some(element);
+                    break;
+                }
+            }
+        }
+
+        let content_root = content_root.unwrap_or_else(|| {
+            let body_selector = Selector::parse("body").unwrap();
+            doc.select(&body_selector).next().unwrap()
+        });
+
+        // Skip nav, header, footer
+        let skip_selector =
+            Selector::parse("nav, header, footer, script, style, noscript").unwrap();
+
+        // Collect image data first (to use later)
+        struct ImageInfo {
+            src: String,
+            data_src: Option<String>,
+            srcset: Option<String>,
+            alt: String,
+        }
+        let mut image_infos = Vec::new();
+        let mut processed_forms = HashSet::new();
+
+        for element in content_root.descendants() {
+            if let Some(elem_ref) = scraper::ElementRef::wrap(element) {
+                let tag_name = elem_ref.value().name();
+
+                // Check if element is inside a skip element
+                let mut should_skip = false;
+                for ancestor in elem_ref.ancestors() {
+                    if let Some(anc_elem) = scraper::ElementRef::wrap(ancestor) {
+                        if skip_selector.matches(&anc_elem) {
+                            should_skip = true;
+                            break;
+                        }
+                    }
+                }
+
+                if should_skip {
+                    continue;
+                }
+
+                if matches!(tag_name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+                    let level = tag_name.chars().last().unwrap().to_digit(10).unwrap() as u8;
+                    let text: String = elem_ref.text().collect::<Vec<_>>().join(" ");
+                    let text = text.trim().to_string();
+                    if !text.is_empty() {
+                        blocks.push(ContentBlock::Heading { level, text });
+                    }
+                } else if tag_name == "p" {
+                    let text: String = elem_ref.text().collect::<Vec<_>>().join(" ");
+                    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !text.is_empty() && text.len() > 20 {
+                        blocks.push(ContentBlock::Paragraph { text });
+                    }
+                } else if tag_name == "img" {
+                    let src = elem_ref.value().attr("src").map(|s| s.to_string());
+                    let data_src = elem_ref.value().attr("data-src").map(|s| s.to_string());
+                    let srcset = elem_ref.value().attr("srcset").map(|s| s.to_string());
+                    let alt = elem_ref.value().attr("alt").unwrap_or("").to_string();
+
+                    if let Some(src_val) = src {
+                        image_infos.push(ImageInfo {
+                            src: src_val,
+                            data_src,
+                            srcset,
+                            alt,
+                        });
+                    }
+                } else if matches!(tag_name, "ul" | "ol") {
+                    let li_selector = Selector::parse("li").unwrap();
+                    let items: Vec<String> = elem_ref
+                        .select(&li_selector)
+                        .map(|li| {
+                            li.text()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .filter(|item| !item.is_empty())
+                        .collect();
+
+                    if !items.is_empty() {
+                        blocks.push(ContentBlock::List { items });
+                    }
+                } else if tag_name == "form" {
+                    // Create unique form ID to avoid duplicates
+                    let form_id = format!("{:p}", elem_ref.value() as *const _);
+                    if !processed_forms.contains(&form_id) {
+                        processed_forms.insert(form_id);
+
+                        let action = elem_ref.value().attr("action").unwrap_or("").to_string();
+                        let method = elem_ref
+                            .value()
+                            .attr("method")
+                            .unwrap_or("get")
+                            .to_uppercase();
+
+                        let mut fields = Vec::new();
+                        let input_selector = Selector::parse("input, textarea, select").unwrap();
+
+                        for input in elem_ref.select(&input_selector) {
+                            let field_type = input
+                                .value()
+                                .attr("type")
+                                .unwrap_or(input.value().name())
+                                .to_string();
+
+                            // Skip hidden fields and buttons in field list
+                            if matches!(field_type.as_str(), "hidden" | "submit" | "button") {
+                                continue;
+                            }
+
+                            let name = input.value().attr("name").unwrap_or("").to_string();
+                            let placeholder = input.value().attr("placeholder").unwrap_or("").to_string();
+                            let required = input.value().attr("required").is_some();
+
+                            // Try to find associated label
+                            let mut label = String::new();
+                            if let Some(id) = input.value().attr("id") {
+                                let label_selector = Selector::parse(&format!("label[for='{}']", id)).unwrap();
+                                if let Some(label_elem) = doc.select(&label_selector).next() {
+                                    label = label_elem.text().collect::<Vec<_>>().join(" ").trim().to_string();
+                                }
+                            }
+                            // Fallback: check if input is inside a label
+                            if label.is_empty() {
+                                for ancestor in input.ancestors() {
+                                    if let Some(anc_elem) = scraper::ElementRef::wrap(ancestor) {
+                                        if anc_elem.value().name() == "label" {
+                                            label = anc_elem.text().collect::<Vec<_>>().join(" ").trim().to_string();
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Extract select options
+                            let mut options = Vec::new();
+                            if input.value().name() == "select" {
+                                let option_selector = Selector::parse("option").unwrap();
+                                for option in input.select(&option_selector) {
+                                    let opt_text = option.text().collect::<Vec<_>>().join(" ").trim().to_string();
+                                    if !opt_text.is_empty() {
+                                        options.push(opt_text);
+                                    }
+                                }
+                            }
+
+                            fields.push(FormField {
+                                field_type,
+                                name,
+                                label,
+                                placeholder,
+                                required,
+                                options,
+                            });
+                        }
+
+                        // Extract submit button text
+                        let mut submit_text = String::from("Submit");
+                        let button_selector = Selector::parse("button[type='submit'], input[type='submit'], button:not([type])").unwrap();
+                        if let Some(submit_btn) = elem_ref.select(&button_selector).next() {
+                            if submit_btn.value().name() == "input" {
+                                submit_text = submit_btn.value().attr("value").unwrap_or("Submit").to_string();
+                            } else {
+                                let text = submit_btn.text().collect::<Vec<_>>().join(" ").trim().to_string();
+                                if !text.is_empty() {
+                                    submit_text = text;
+                                }
+                            }
+                        }
+
+                        blocks.push(ContentBlock::Form {
+                            action,
+                            method,
+                            fields,
+                            submit_text,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Now process images asynchronously
+        for img_info in image_infos {
+            let mut img_sources = vec![img_info.src.as_str()];
+            if let Some(ref ds) = img_info.data_src {
+                img_sources.push(ds.as_str());
+            }
+            if let Some(ref srcset) = img_info.srcset {
+                if let Some(first_src) = srcset.split(',').next() {
+                    let url_part = first_src.split_whitespace().next().unwrap_or("");
+                    if !url_part.is_empty() {
+                        img_sources.push(url_part);
+                    }
+                }
+            }
+
+            for src in img_sources {
+                if let Ok(absolute_url) = page_url.join(src) {
+                    let img_url = absolute_url.to_string();
+
+                    if img_url.starts_with("data:")
+                        || img_url.contains("1x1")
+                        || img_url.contains("placeholder")
+                        || seen_image_urls.contains(&img_url)
+                    {
+                        continue;
+                    }
+
+                    seen_image_urls.insert(img_url.clone());
+
+                    if let Some(local_path) = self.download_image(&img_url, output_dir).await {
+                        blocks.push(ContentBlock::Image {
+                            original_url: img_url,
+                            local_path,
+                            alt_text: img_info.alt.clone(),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        blocks
+    }
+
+    async fn scrape_page(&self, url: String, output_dir: &str) -> Option<PageData> {
         let _permit = self.semaphore.acquire().await.ok()?;
 
         let response = self.client.get(&url).send().await.ok()?;
@@ -117,6 +468,8 @@ impl Scraper {
         let body = response.text().await.ok()?;
         let doc = Html::parse_document(&body);
 
+        let page_url = Url::parse(&url).ok()?;
+
         // Extract title
         let title_selector = Selector::parse("title").unwrap();
         let title = doc
@@ -125,40 +478,88 @@ impl Scraper {
             .map(|el| el.text().collect::<String>().trim().to_string())
             .unwrap_or_else(|| "No title".to_string());
 
-        // Extract text content (remove script, style, etc.)
-        let body_selector = Selector::parse("body").unwrap();
-        let script_selector = Selector::parse("script, style, noscript").unwrap();
+        // Extract meta tags
+        let meta_selector = Selector::parse("meta").unwrap();
+        let mut meta_title = String::new();
+        let mut meta_description = String::new();
 
-        let mut content = String::new();
-        if let Some(body) = doc.select(&body_selector).next() {
-            let mut body_html = body.html();
-
-            // Remove scripts and styles
-            let temp_doc = Html::parse_fragment(&body_html);
-            for element in temp_doc.select(&script_selector) {
-                body_html = body_html.replace(&element.html(), "");
+        for element in doc.select(&meta_selector) {
+            if let Some(property) = element.value().attr("property") {
+                if property == "og:title" {
+                    meta_title = element.value().attr("content").unwrap_or("").to_string();
+                } else if property == "og:description" && meta_description.is_empty() {
+                    meta_description =
+                        element.value().attr("content").unwrap_or("").to_string();
+                }
+            } else if let Some(name) = element.value().attr("name") {
+                if name == "title" && meta_title.is_empty() {
+                    meta_title = element.value().attr("content").unwrap_or("").to_string();
+                } else if name == "description" && meta_description.is_empty() {
+                    meta_description = element.value().attr("content").unwrap_or("").to_string();
+                }
             }
-
-            let cleaned_doc = Html::parse_fragment(&body_html);
-            content = cleaned_doc
-                .root_element()
-                .text()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
         }
 
-        let word_count = content.split_whitespace().count();
+        // Fallback to title tag if no meta title
+        if meta_title.is_empty() {
+            meta_title = title.clone();
+        }
 
-        println!("✓ Scraped: {} ({} words)", url, word_count);
+        // Extract structured content blocks
+        let content_blocks = self
+            .extract_content_blocks(&doc, &page_url, output_dir)
+            .await;
+
+        // Calculate total word count from all blocks
+        let total_words = content_blocks.iter().fold(0, |acc, block| {
+            acc + match block {
+                ContentBlock::Heading { text, .. } => text.split_whitespace().count(),
+                ContentBlock::Paragraph { text } => text.split_whitespace().count(),
+                ContentBlock::List { items } => items
+                    .iter()
+                    .map(|item| item.split_whitespace().count())
+                    .sum(),
+                ContentBlock::Image { .. } => 0,
+                ContentBlock::Form { .. } => 0,
+            }
+        });
+
+        let image_count = content_blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Image { .. }))
+            .count();
+
+        let form_count = content_blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Form { .. }))
+            .count();
+
+        let stats = if form_count > 0 {
+            format!(
+                "{} blocks, {} words, {} images, {} forms",
+                content_blocks.len(),
+                total_words,
+                image_count,
+                form_count
+            )
+        } else {
+            format!(
+                "{} blocks, {} words, {} images",
+                content_blocks.len(),
+                total_words,
+                image_count
+            )
+        };
+
+        println!("✓ Scraped: {} ({})", url, stats);
 
         Some(PageData {
             url,
             title,
-            content,
-            word_count,
+            meta_title,
+            meta_description,
+            content_blocks,
+            total_words,
         })
     }
 
@@ -260,9 +661,12 @@ impl Scraper {
         discovered_urls
     }
 
-    async fn scrape_all(&self, urls: Vec<String>) -> Vec<PageData> {
+    async fn scrape_all(&self, urls: Vec<String>, output_dir: String) -> Vec<PageData> {
         stream::iter(urls)
-            .map(|url| self.scrape_page(url))
+            .map(|url| {
+                let output_dir = output_dir.clone();
+                async move { self.scrape_page(url, &output_dir).await }
+            })
             .buffer_unordered(self.semaphore.available_permits())
             .filter_map(|x| async { x })
             .collect()
@@ -311,7 +715,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total = urls.len();
     println!("📊 Found {} URLs to scrape", total);
 
-    let pages = scraper.scrape_all(urls).await;
+    // Create output directories
+    let output_path = std::path::Path::new(&args.output);
+    let output_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
+    let images_dir = output_dir.join("images");
+
+    std::fs::create_dir_all(output_dir)?;
+    std::fs::create_dir_all(&images_dir)?;
+
+    let images_dir_str = images_dir.to_string_lossy().to_string();
+
+    let pages = scraper.scrape_all(urls, images_dir_str).await;
 
     let result = ScrapedData {
         total_pages: pages.len(),
@@ -320,12 +734,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write to file
     let json = serde_json::to_string_pretty(&result)?;
-
-    // Ensure output directory exists
-    if let Some(parent) = std::path::Path::new(&args.output).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
     std::fs::write(&args.output, json)?;
 
     println!("✅ Done! Scraped {}/{} pages", result.total_pages, total);

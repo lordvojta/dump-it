@@ -8,10 +8,14 @@ High-performance website scraper built with Rust. Intelligently scrapes websites
 - **Intelligent crawler** - Discovers pages by following links when no sitemap exists
 - **Domain-bounded** - Stays within the target domain, won't follow external links
 - **Duplicate prevention** - Tracks visited URLs to avoid re-scraping
-- **Clean text extraction** - Removes HTML, scripts, styles, extracts pure content
+- **Structured content** - Preserves page layout with headings, paragraphs, lists, images, and forms
+- **Form extraction** - Captures all form fields, labels, types, and submit buttons
+- **Image downloading** - Automatically downloads and saves all images from pages
+- **Smart filtering** - Skips tracking pixels, tiny images, and analytics scripts
+- **Meta tag extraction** - Captures meta title and meta description for SEO context
 - **Concurrent scraping** - Fetches multiple pages in parallel for speed
 - **Configurable limits** - Control depth, max pages, concurrency, timeouts
-- **JSON output** - Structured data with URLs, titles, content, word counts
+- **JSON output** - Structured data preserving page layout and hierarchy
 
 ## Installation
 
@@ -19,7 +23,7 @@ High-performance website scraper built with Rust. Intelligently scrapes websites
 
 ```bash
 # Clone the repository
-git clone https://github.com/vojtakotrc/dump-it.git
+git clone https://github.com/lordvojta/dump-it.git
 cd dump-it
 
 # Build in release mode
@@ -38,7 +42,7 @@ cargo install dump-it
 
 ### Pre-built Binaries
 
-Download pre-built binaries from the [Releases](https://github.com/vojtakotrc/dump-it/releases) page.
+Download pre-built binaries from the [Releases](https://github.com/lordvojta/dump-it/releases) page.
 
 ## Quick Start
 
@@ -85,19 +89,148 @@ Download pre-built binaries from the [Releases](https://github.com/vojtakotrc/du
 
 ## Output Format
 
+The scraper outputs structured JSON that preserves the page layout and content hierarchy:
+
 ```json
 {
-  "total_pages": 42,
+  "total_pages": 4,
   "pages": [
     {
       "url": "https://example.com/page",
       "title": "Page Title",
-      "content": "Full text content...",
-      "word_count": 1234
+      "meta_title": "SEO Optimized Title",
+      "meta_description": "Page description for search engines",
+      "content_blocks": [
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "Main Heading"
+        },
+        {
+          "type": "paragraph",
+          "text": "This is a paragraph with clean text content..."
+        },
+        {
+          "type": "list",
+          "items": [
+            "First list item",
+            "Second list item",
+            "Third list item"
+          ]
+        },
+        {
+          "type": "image",
+          "original_url": "https://example.com/photo.jpg",
+          "local_path": "output/images/abc123def456.jpg",
+          "alt_text": "Photo description"
+        },
+        {
+          "type": "heading",
+          "level": 2,
+          "text": "Subheading"
+        },
+        {
+          "type": "paragraph",
+          "text": "More content here..."
+        }
+      ],
+      "total_words": 450
     }
   ]
 }
 ```
+
+### Block Types
+
+Content is structured into blocks that preserve the page layout:
+
+**Heading Block**
+```json
+{
+  "type": "heading",
+  "level": 1,      // 1-6 for h1-h6
+  "text": "Heading text"
+}
+```
+
+**Paragraph Block**
+```json
+{
+  "type": "paragraph",
+  "text": "Clean paragraph text with whitespace normalized"
+}
+```
+
+**List Block**
+```json
+{
+  "type": "list",
+  "items": ["Item 1", "Item 2", "Item 3"]
+}
+```
+
+**Image Block** (appears in context where image was on page)
+```json
+{
+  "type": "image",
+  "original_url": "https://example.com/image.jpg",
+  "local_path": "output/images/hash.jpg",
+  "alt_text": "Image description"
+}
+```
+
+**Form Block** (captures contact forms, search forms, etc.)
+```json
+{
+  "type": "form",
+  "action": "/submit",
+  "method": "POST",
+  "fields": [
+    {
+      "field_type": "text",
+      "name": "name",
+      "label": "Your Name",
+      "placeholder": "Enter your name",
+      "required": true,
+      "options": []
+    },
+    {
+      "field_type": "email",
+      "name": "email",
+      "label": "Email Address",
+      "placeholder": "you@example.com",
+      "required": true,
+      "options": []
+    },
+    {
+      "field_type": "select",
+      "name": "subject",
+      "label": "Subject",
+      "placeholder": "",
+      "required": false,
+      "options": ["General Inquiry", "Support", "Sales"]
+    },
+    {
+      "field_type": "textarea",
+      "name": "message",
+      "label": "Message",
+      "placeholder": "Your message here...",
+      "required": true,
+      "options": []
+    }
+  ],
+  "submit_text": "Send Message"
+}
+```
+
+### Page-Level Fields
+
+- `url` - The page URL
+- `title` - Page title from `<title>` tag
+- `meta_title` - SEO title from meta tags (fallback to title)
+- `meta_description` - SEO description from meta tags
+- `content_blocks[]` - Ordered array of content blocks preserving layout
+- `total_words` - Total word count across all text blocks
 
 ## How It Works
 
@@ -180,27 +313,36 @@ Optimized release build with:
 
 ## Output Location
 
-All JSON outputs are saved to the `output/` folder (gitignored by default).
+All outputs are saved to the `output/` folder (gitignored by default):
+- `output/scraped.json` - Main JSON file with all scraped data
+- `output/images/` - Downloaded images (named with content hash)
+
+Images are saved with SHA-256 hash-based filenames to avoid duplicates and collisions.
 
 ## Real-World Example
 
 ```bash
-$ ./target/release/dump-it --url https://vytvorit-web.cz
+$ ./target/release/dump-it --url https://www.prag-travel.de/
 🚀 Starting scraper...
-Target: https://vytvorit-web.cz
+Target: https://www.prag-travel.de/
 Concurrency: 10
-🔍 Looking for sitemap at: https://vytvorit-web.cz/sitemap.xml
-✓ Found sitemap with 4 URLs
-📊 Found 4 URLs to scrape
-✓ Scraped: https://vytvorit-web.cz/blog (109 words)
-✓ Scraped: https://vytvorit-web.cz (858 words)
-✓ Scraped: https://vytvorit-web.cz/ochrana-osobnich-udaju (836 words)
-✓ Scraped: https://vytvorit-web.cz/obchodni-podminky (1183 words)
-✅ Done! Scraped 4/4 pages
+🔍 Looking for sitemap at: https://www.prag-travel.de/sitemap.xml
+✓ Found sitemap with 36 URLs
+📊 Found 36 URLs to scrape
+✓ Scraped: https://www.prag-travel.de/blog-bootsfahrt-in-prag/ (5 blocks, 10 words, 1 images)
+✓ Scraped: https://www.prag-travel.de/referenz/ (7 blocks, 17 words, 2 images)
+✓ Scraped: https://www.prag-travel.de/anfrage-formular/ (7 blocks, 23 words, 1 images)
+...
+✓ Scraped: https://www.prag-travel.de/ (24 blocks, 179 words, 8 images)
+✅ Done! Scraped 36/36 pages
 💾 Output saved to: output/scraped.json
 ```
 
-Result: 24KB JSON file with complete text content from all pages.
+Result:
+- JSON file with structured content blocks preserving page layout
+- 152 images downloaded to `output/images/` folder
+- Content organized into headings, paragraphs, lists, images, and forms
+- Images and forms appear inline where they occurred on the page
 
 ## Tips & Best Practices
 
@@ -251,6 +393,8 @@ This is normal. The tool will automatically discover pages by following links.
 - **Authentication**: Cannot scrape pages behind login walls
 - **Rate limiting**: Some sites may block high-frequency requests
 - **Dynamic content**: AJAX-loaded content is not captured
+- **Image formats**: Downloads images as-is (no format conversion)
+- **Large images**: No automatic resizing or optimization
 
 ## Contributing
 
@@ -278,7 +422,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Author
 
-Vojtech Kotrc - [GitHub](https://github.com/vojtakotrc)
+Vojtech Kotrc - [GitHub](https://github.com/lordvojta)
 
 ## Acknowledgments
 
