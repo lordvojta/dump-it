@@ -1,0 +1,26 @@
+[package]
+name = "dump-it"
+version = "0.1.0"
+edition = "2021"
+authors = ["Vojtěch Kotrč"]
+description = "High-performance website scraper with sitemap support and intelligent crawling"
+license = "MIT"
+repository = "https://github.com/vojtakotrc/dump-it"
+keywords = ["scraper", "crawler", "web", "sitemap", "cli"]
+categories = ["command-line-utilities", "web-programming"]
+
+[dependencies]
+tokio = { version = "1.41", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+scraper = "0.20"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+url = "2.5"
+futures = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,15 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Output files
+/output/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+.claude/
