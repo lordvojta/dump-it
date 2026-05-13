@@ -1,15 +1,96 @@
-# Rust
+# Rust build artefacts
 /target/
 **/*.rs.bk
 *.pdb
+*.rlib
+*.rmeta
 
-# Output files
+# Cargo
+Cargo.lock.bak
+
+# Scraper output (master + per-site test dirs)
 /output/
+/output_*/
+/test_runs/
+
+# Environment / secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets.toml
 
 # macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+Icon?
 
-# IDE
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.Trash-*
+
+# IDE / editor
 .vscode/
 .idea/
+.vs/
 .claude/
+.cursor/
+.zed/
+.fleet/
+.aider/
+.aider.tags.cache/
+.aider.chat.history.md
+.history/
+*.swp
+*.swo
+*.swn
+*.bak
+*~
+.#*
+\#*\#
+
+# Temporary
+*.tmp
+*.log
+*.cache
+*.pid
+
+# Patch / merge leftovers
+*.orig
+*.rej
+
+# Profiling / coverage
+*.profraw
+*.profdata
+coverage/
+tarpaulin-report.html
+lcov.info
+
+# Crash dumps
+*.crash
+*.dmp
+
+# Common JS toolchain (in case a sub-project is added later)
+node_modules/
+dist/
+.pnpm-store/
+
+# Deploy temp
+.vercel/
+.fly/
+.netlify/
+
+# Misc
+.envrc
+*.session
