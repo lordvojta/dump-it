@@ -1,743 +1,841 @@
+use anyhow::Context;
 use clap::Parser;
-use futures::stream::{self, StreamExt};
-use reqwest::Client;
-use scraper::{Html, Selector};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
-use std::path::Path;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::fs;
-use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
-type SitemapResult<'a> = Pin<
-    Box<dyn std::future::Future<Output = Result<Vec<String>, Box<dyn std::error::Error>>> + 'a>,
->;
+mod brand;
+mod chrome;
+mod cli;
+mod contact;
+mod extract;
+mod model;
+mod output;
+mod scrape;
+mod selectors;
+mod util;
 
-#[derive(Parser)]
-#[command(name = "dump-it")]
-#[command(about = "High-performance website scraper with sitemap support", long_about = None)]
-struct Args {
-    /// Target website URL or sitemap URL
-    #[arg(short, long)]
-    url: String,
+use crate::brand::{
+    aggregate_brand_palette, detect_webfont_urls, dominant_colors_from_image, download_asset,
+    fetch_external_css, merge_webfont_families,
+};
+use crate::chrome::capture_screenshot;
+use crate::cli::Args;
+use crate::extract::download_image;
+use crate::model::ScrapedData;
+use crate::output::{
+    aggregate_contact, build_asset_manifest, build_compact, build_hreflang_groups, build_index_md,
+    build_schema_json, build_site_data, detect_frameworks_from_html, detect_quality_flags,
+    detect_quality_warnings, detect_sections, detect_templates, page_to_markdown,
+};
+use crate::scrape::Scraper;
+use crate::util::{
+    build_exclude_patterns, build_include_patterns, canonicalize_url, is_disallowed_by_robots,
+    normalize_path, url_matches_excludes, url_matches_includes, url_priority, url_to_host_slug,
+    url_to_slug,
+};
 
-    /// Maximum concurrent requests
-    #[arg(short, long, default_value = "10")]
-    concurrency: usize,
-
-    /// Request timeout in seconds
-    #[arg(short, long, default_value = "30")]
-    timeout: u64,
-
-    /// Output JSON file path
-    #[arg(short, long, default_value = "output/scraped.json")]
-    output: String,
-
-    /// Maximum crawl depth when no sitemap exists (0 = single page, default: 3)
-    #[arg(short = 'd', long, default_value = "3")]
-    max_depth: usize,
-
-    /// Maximum pages to scrape (prevents runaway crawling)
-    #[arg(short = 'm', long, default_value = "1000")]
-    max_pages: usize,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct FormField {
-    field_type: String,
-    name: String,
-    label: String,
-    placeholder: String,
-    required: bool,
-    options: Vec<String>, // for select/radio/checkbox
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum ContentBlock {
-    Heading {
-        level: u8,
-        text: String,
-    },
-    Paragraph {
-        text: String,
-    },
-    Image {
-        original_url: String,
-        local_path: String,
-        alt_text: String,
-    },
-    List {
-        items: Vec<String>,
-    },
-    Form {
-        action: String,
-        method: String,
-        fields: Vec<FormField>,
-        submit_text: String,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-struct PageData {
-    url: String,
-    title: String,
-    meta_title: String,
-    meta_description: String,
-    content_blocks: Vec<ContentBlock>,
-    total_words: usize,
-}
-
-#[derive(Serialize)]
-struct ScrapedData {
-    total_pages: usize,
-    pages: Vec<PageData>,
-}
-
-struct Scraper {
-    client: Client,
-    semaphore: Arc<Semaphore>,
-}
-
-impl Scraper {
-    fn new(concurrency: usize, timeout: u64) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(timeout))
-            .user_agent("Mozilla/5.0 (compatible; DumpIt/0.1)")
-            .build()
-            .expect("Failed to create HTTP client");
-
-        Self {
-            client,
-            semaphore: Arc::new(Semaphore::new(concurrency)),
-        }
+/// Write a minimal "crashed before output" index.md when main() fails
+/// before reaching the normal output path. Round L fix for Martinus.cz:
+/// Chrome crashed during sitemap fetch, the run never reached the bundle-
+/// writing step, and the user had ZERO files. Now the user always gets at
+/// least an `index.md` with a banner explaining what happened.
+fn write_crash_bundle(output_dir: &std::path::Path, target_url: &str, error_message: &str) {
+    if std::fs::create_dir_all(output_dir).is_err() {
+        return;
     }
-
-    fn fetch_sitemap<'a>(&'a self, url: &'a str) -> SitemapResult<'a> {
-        Box::pin(async move {
-            let response = self.client.get(url).send().await?;
-            let body = response.text().await?;
-
-            let mut urls = Vec::new();
-            let doc = Html::parse_document(&body);
-
-            // Try XML sitemap first
-            if body.contains("<urlset") || body.contains("<sitemapindex") {
-                let loc_selector = Selector::parse("loc").unwrap();
-                for element in doc.select(&loc_selector) {
-                    let url = element.text().collect::<String>().trim().to_string();
-                    if url.ends_with(".xml") {
-                        // Recursive sitemap
-                        if let Ok(sub_urls) = self.fetch_sitemap(&url).await {
-                            urls.extend(sub_urls);
-                        }
-                    } else {
-                        urls.push(url);
-                    }
-                }
-            } else {
-                // Fallback: just scrape the given URL
-                urls.push(url.to_string());
-            }
-
-            Ok(urls)
-        })
-    }
-
-    async fn download_image(&self, img_url: &str, output_dir: &str) -> Option<String> {
-        // Filter out tracking pixels and unwanted images
-        let lower_url = img_url.to_lowercase();
-        let tracking_domains = [
-            "googletagmanager",
-            "google-analytics",
-            "facebook.com/tr",
-            "doubleclick",
-            "analytics",
-            "tracking",
-            "pixel",
-            "beacon",
-        ];
-
-        for domain in &tracking_domains {
-            if lower_url.contains(domain) {
-                return None;
-            }
-        }
-
-        // Create hash-based filename from URL
-        let mut hasher = Sha256::new();
-        hasher.update(img_url.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
-
-        // Get file extension from URL
-        let extension = img_url
-            .split('?')
-            .next()?
-            .split('.')
-            .last()
-            .unwrap_or("jpg");
-
-        let filename = format!("{}.{}", &hash[..16], extension);
-        let filepath = format!("{}/{}", output_dir, filename);
-
-        // Check if already downloaded
-        if Path::new(&filepath).exists() {
-            return Some(filepath);
-        }
-
-        // Download image
-        match self.client.get(img_url).send().await {
-            Ok(response) if response.status().is_success() => {
-                if let Ok(bytes) = response.bytes().await {
-                    // Skip very small images (< 1KB, likely tracking pixels)
-                    if bytes.len() < 1024 {
-                        return None;
-                    }
-                    if fs::write(&filepath, &bytes).await.is_ok() {
-                        return Some(filepath);
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        None
-    }
-
-    async fn extract_content_blocks(
-        &self,
-        doc: &Html,
-        page_url: &Url,
-        output_dir: &str,
-    ) -> Vec<ContentBlock> {
-        let mut blocks = Vec::new();
-        let mut seen_image_urls = HashSet::new();
-
-        // Select main content area
-        let main_selectors = ["main", "article", "[role='main']", "body"];
-        let mut content_root = None;
-
-        for selector_str in &main_selectors {
-            if let Ok(selector) = Selector::parse(selector_str) {
-                if let Some(element) = doc.select(&selector).next() {
-                    content_root = Some(element);
-                    break;
-                }
-            }
-        }
-
-        let content_root = content_root.unwrap_or_else(|| {
-            let body_selector = Selector::parse("body").unwrap();
-            doc.select(&body_selector).next().unwrap()
-        });
-
-        // Skip nav, header, footer
-        let skip_selector =
-            Selector::parse("nav, header, footer, script, style, noscript").unwrap();
-
-        // Collect image data first (to use later)
-        struct ImageInfo {
-            src: String,
-            data_src: Option<String>,
-            srcset: Option<String>,
-            alt: String,
-        }
-        let mut image_infos = Vec::new();
-        let mut processed_forms = HashSet::new();
-
-        for element in content_root.descendants() {
-            if let Some(elem_ref) = scraper::ElementRef::wrap(element) {
-                let tag_name = elem_ref.value().name();
-
-                // Check if element is inside a skip element
-                let mut should_skip = false;
-                for ancestor in elem_ref.ancestors() {
-                    if let Some(anc_elem) = scraper::ElementRef::wrap(ancestor) {
-                        if skip_selector.matches(&anc_elem) {
-                            should_skip = true;
-                            break;
-                        }
-                    }
-                }
-
-                if should_skip {
-                    continue;
-                }
-
-                if matches!(tag_name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
-                    let level = tag_name.chars().last().unwrap().to_digit(10).unwrap() as u8;
-                    let text: String = elem_ref.text().collect::<Vec<_>>().join(" ");
-                    let text = text.trim().to_string();
-                    if !text.is_empty() {
-                        blocks.push(ContentBlock::Heading { level, text });
-                    }
-                } else if tag_name == "p" {
-                    let text: String = elem_ref.text().collect::<Vec<_>>().join(" ");
-                    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                    if !text.is_empty() && text.len() > 20 {
-                        blocks.push(ContentBlock::Paragraph { text });
-                    }
-                } else if tag_name == "img" {
-                    let src = elem_ref.value().attr("src").map(|s| s.to_string());
-                    let data_src = elem_ref.value().attr("data-src").map(|s| s.to_string());
-                    let srcset = elem_ref.value().attr("srcset").map(|s| s.to_string());
-                    let alt = elem_ref.value().attr("alt").unwrap_or("").to_string();
-
-                    if let Some(src_val) = src {
-                        image_infos.push(ImageInfo {
-                            src: src_val,
-                            data_src,
-                            srcset,
-                            alt,
-                        });
-                    }
-                } else if matches!(tag_name, "ul" | "ol") {
-                    let li_selector = Selector::parse("li").unwrap();
-                    let items: Vec<String> = elem_ref
-                        .select(&li_selector)
-                        .map(|li| {
-                            li.text()
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                                .split_whitespace()
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .filter(|item| !item.is_empty())
-                        .collect();
-
-                    if !items.is_empty() {
-                        blocks.push(ContentBlock::List { items });
-                    }
-                } else if tag_name == "form" {
-                    // Create unique form ID to avoid duplicates
-                    let form_id = format!("{:p}", elem_ref.value() as *const _);
-                    if !processed_forms.contains(&form_id) {
-                        processed_forms.insert(form_id);
-
-                        let action = elem_ref.value().attr("action").unwrap_or("").to_string();
-                        let method = elem_ref
-                            .value()
-                            .attr("method")
-                            .unwrap_or("get")
-                            .to_uppercase();
-
-                        let mut fields = Vec::new();
-                        let input_selector = Selector::parse("input, textarea, select").unwrap();
-
-                        for input in elem_ref.select(&input_selector) {
-                            let field_type = input
-                                .value()
-                                .attr("type")
-                                .unwrap_or(input.value().name())
-                                .to_string();
-
-                            // Skip hidden fields and buttons in field list
-                            if matches!(field_type.as_str(), "hidden" | "submit" | "button") {
-                                continue;
-                            }
-
-                            let name = input.value().attr("name").unwrap_or("").to_string();
-                            let placeholder = input.value().attr("placeholder").unwrap_or("").to_string();
-                            let required = input.value().attr("required").is_some();
-
-                            // Try to find associated label
-                            let mut label = String::new();
-                            if let Some(id) = input.value().attr("id") {
-                                let label_selector = Selector::parse(&format!("label[for='{}']", id)).unwrap();
-                                if let Some(label_elem) = doc.select(&label_selector).next() {
-                                    label = label_elem.text().collect::<Vec<_>>().join(" ").trim().to_string();
-                                }
-                            }
-                            // Fallback: check if input is inside a label
-                            if label.is_empty() {
-                                for ancestor in input.ancestors() {
-                                    if let Some(anc_elem) = scraper::ElementRef::wrap(ancestor) {
-                                        if anc_elem.value().name() == "label" {
-                                            label = anc_elem.text().collect::<Vec<_>>().join(" ").trim().to_string();
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Extract select options
-                            let mut options = Vec::new();
-                            if input.value().name() == "select" {
-                                let option_selector = Selector::parse("option").unwrap();
-                                for option in input.select(&option_selector) {
-                                    let opt_text = option.text().collect::<Vec<_>>().join(" ").trim().to_string();
-                                    if !opt_text.is_empty() {
-                                        options.push(opt_text);
-                                    }
-                                }
-                            }
-
-                            fields.push(FormField {
-                                field_type,
-                                name,
-                                label,
-                                placeholder,
-                                required,
-                                options,
-                            });
-                        }
-
-                        // Extract submit button text
-                        let mut submit_text = String::from("Submit");
-                        let button_selector = Selector::parse("button[type='submit'], input[type='submit'], button:not([type])").unwrap();
-                        if let Some(submit_btn) = elem_ref.select(&button_selector).next() {
-                            if submit_btn.value().name() == "input" {
-                                submit_text = submit_btn.value().attr("value").unwrap_or("Submit").to_string();
-                            } else {
-                                let text = submit_btn.text().collect::<Vec<_>>().join(" ").trim().to_string();
-                                if !text.is_empty() {
-                                    submit_text = text;
-                                }
-                            }
-                        }
-
-                        blocks.push(ContentBlock::Form {
-                            action,
-                            method,
-                            fields,
-                            submit_text,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Now process images asynchronously
-        for img_info in image_infos {
-            let mut img_sources = vec![img_info.src.as_str()];
-            if let Some(ref ds) = img_info.data_src {
-                img_sources.push(ds.as_str());
-            }
-            if let Some(ref srcset) = img_info.srcset {
-                if let Some(first_src) = srcset.split(',').next() {
-                    let url_part = first_src.split_whitespace().next().unwrap_or("");
-                    if !url_part.is_empty() {
-                        img_sources.push(url_part);
-                    }
-                }
-            }
-
-            for src in img_sources {
-                if let Ok(absolute_url) = page_url.join(src) {
-                    let img_url = absolute_url.to_string();
-
-                    if img_url.starts_with("data:")
-                        || img_url.contains("1x1")
-                        || img_url.contains("placeholder")
-                        || seen_image_urls.contains(&img_url)
-                    {
-                        continue;
-                    }
-
-                    seen_image_urls.insert(img_url.clone());
-
-                    if let Some(local_path) = self.download_image(&img_url, output_dir).await {
-                        blocks.push(ContentBlock::Image {
-                            original_url: img_url,
-                            local_path,
-                            alt_text: img_info.alt.clone(),
-                        });
-                        break;
-                    }
-                }
-            }
-        }
-
-        blocks
-    }
-
-    async fn scrape_page(&self, url: String, output_dir: &str) -> Option<PageData> {
-        let _permit = self.semaphore.acquire().await.ok()?;
-
-        let response = self.client.get(&url).send().await.ok()?;
-        if !response.status().is_success() {
-            eprintln!("Failed to fetch {}: {}", url, response.status());
-            return None;
-        }
-
-        let body = response.text().await.ok()?;
-        let doc = Html::parse_document(&body);
-
-        let page_url = Url::parse(&url).ok()?;
-
-        // Extract title
-        let title_selector = Selector::parse("title").unwrap();
-        let title = doc
-            .select(&title_selector)
-            .next()
-            .map(|el| el.text().collect::<String>().trim().to_string())
-            .unwrap_or_else(|| "No title".to_string());
-
-        // Extract meta tags
-        let meta_selector = Selector::parse("meta").unwrap();
-        let mut meta_title = String::new();
-        let mut meta_description = String::new();
-
-        for element in doc.select(&meta_selector) {
-            if let Some(property) = element.value().attr("property") {
-                if property == "og:title" {
-                    meta_title = element.value().attr("content").unwrap_or("").to_string();
-                } else if property == "og:description" && meta_description.is_empty() {
-                    meta_description =
-                        element.value().attr("content").unwrap_or("").to_string();
-                }
-            } else if let Some(name) = element.value().attr("name") {
-                if name == "title" && meta_title.is_empty() {
-                    meta_title = element.value().attr("content").unwrap_or("").to_string();
-                } else if name == "description" && meta_description.is_empty() {
-                    meta_description = element.value().attr("content").unwrap_or("").to_string();
-                }
-            }
-        }
-
-        // Fallback to title tag if no meta title
-        if meta_title.is_empty() {
-            meta_title = title.clone();
-        }
-
-        // Extract structured content blocks
-        let content_blocks = self
-            .extract_content_blocks(&doc, &page_url, output_dir)
-            .await;
-
-        // Calculate total word count from all blocks
-        let total_words = content_blocks.iter().fold(0, |acc, block| {
-            acc + match block {
-                ContentBlock::Heading { text, .. } => text.split_whitespace().count(),
-                ContentBlock::Paragraph { text } => text.split_whitespace().count(),
-                ContentBlock::List { items } => items
-                    .iter()
-                    .map(|item| item.split_whitespace().count())
-                    .sum(),
-                ContentBlock::Image { .. } => 0,
-                ContentBlock::Form { .. } => 0,
-            }
-        });
-
-        let image_count = content_blocks
-            .iter()
-            .filter(|b| matches!(b, ContentBlock::Image { .. }))
-            .count();
-
-        let form_count = content_blocks
-            .iter()
-            .filter(|b| matches!(b, ContentBlock::Form { .. }))
-            .count();
-
-        let stats = if form_count > 0 {
-            format!(
-                "{} blocks, {} words, {} images, {} forms",
-                content_blocks.len(),
-                total_words,
-                image_count,
-                form_count
-            )
-        } else {
-            format!(
-                "{} blocks, {} words, {} images",
-                content_blocks.len(),
-                total_words,
-                image_count
-            )
-        };
-
-        println!("✓ Scraped: {} ({})", url, stats);
-
-        Some(PageData {
-            url,
-            title,
-            meta_title,
-            meta_description,
-            content_blocks,
-            total_words,
-        })
-    }
-
-    fn extract_links(&self, html: &str, base_url: &Url) -> Vec<String> {
-        let doc = Html::parse_document(html);
-        let link_selector = Selector::parse("a[href]").unwrap();
-        let mut links = Vec::new();
-
-        for element in doc.select(&link_selector) {
-            if let Some(href) = element.value().attr("href") {
-                // Resolve relative URLs
-                if let Ok(absolute_url) = base_url.join(href) {
-                    let url_str = absolute_url.to_string();
-                    // Filter out anchors, mailto, tel, javascript, etc.
-                    if url_str.starts_with("http://") || url_str.starts_with("https://") {
-                        // Remove fragments
-                        let clean_url = url_str.split('#').next().unwrap_or(&url_str).to_string();
-                        if !clean_url.is_empty() {
-                            links.push(clean_url);
-                        }
-                    }
-                }
-            }
-        }
-
-        links
-    }
-
-    async fn crawl(&self, start_url: &str, max_depth: usize, max_pages: usize) -> Vec<String> {
-        let base_url = match Url::parse(start_url) {
-            Ok(url) => url,
-            Err(_) => return vec![start_url.to_string()],
-        };
-
-        let base_domain = match base_url.host_str() {
-            Some(host) => host,
-            None => return vec![start_url.to_string()],
-        };
-
-        let visited = Arc::new(Mutex::new(HashSet::new()));
-        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-        queue.push_back((start_url.to_string(), 0));
-
-        let mut discovered_urls = Vec::new();
-        visited.lock().await.insert(start_url.to_string());
-
-        println!(
-            "🕷️  Crawling website (max depth: {}, max pages: {})...",
-            max_depth, max_pages
-        );
-
-        while let Some((url, depth)) = queue.pop_front() {
-            if discovered_urls.len() >= max_pages {
-                println!("⚠️  Reached max pages limit ({})", max_pages);
-                break;
-            }
-
-            discovered_urls.push(url.clone());
-
-            if depth >= max_depth {
-                continue;
-            }
-
-            // Fetch page and extract links
-            let _permit = self.semaphore.acquire().await.ok();
-            if let Ok(response) = self.client.get(&url).send().await {
-                if response.status().is_success() {
-                    if let Ok(body) = response.text().await {
-                        let current_url = Url::parse(&url).unwrap();
-                        let links = self.extract_links(&body, &current_url);
-
-                        for link in links {
-                            // Only follow links on the same domain
-                            if let Ok(link_url) = Url::parse(&link) {
-                                if let Some(link_domain) = link_url.host_str() {
-                                    if link_domain == base_domain {
-                                        let mut visited_lock = visited.lock().await;
-                                        if !visited_lock.contains(&link) {
-                                            visited_lock.insert(link.clone());
-                                            queue.push_back((link, depth + 1));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if discovered_urls.len() % 10 == 0 && !discovered_urls.is_empty() {
-                println!("📍 Discovered {} pages so far...", discovered_urls.len());
-            }
-        }
-
-        println!(
-            "✓ Crawl complete: found {} unique URLs",
-            discovered_urls.len()
-        );
-        discovered_urls
-    }
-
-    async fn scrape_all(&self, urls: Vec<String>, output_dir: String) -> Vec<PageData> {
-        stream::iter(urls)
-            .map(|url| {
-                let output_dir = output_dir.clone();
-                async move { self.scrape_page(url, &output_dir).await }
-            })
-            .buffer_unordered(self.semaphore.available_permits())
-            .filter_map(|x| async { x })
-            .collect()
-            .await
-    }
+    let body = format!(
+        "# Site Export — {target_url}\n\n\
+         > Generated by [dump-it](https://github.com/lordvojta/dump-it).\n\n\
+         ## ❌ Scrape crashed — no bundle produced\n\n\
+         The scraper exited before completing. **No content was captured.** \
+         Most likely cause: headless Chrome timed out or crashed during \
+         sitemap fetch / page render. This is a known instability on \
+         sites with very large sitemaps (Martinus regression: 80+ robots \
+         rules + a 50k-URL sitemap) or aggressive WAFs.\n\n\
+         **Recovery suggestions:**\n\n\
+         - Re-run with `--no-js` to bypass Chrome entirely (works for \
+           server-rendered sites).\n\
+         - Re-run with `--max-pages 5` to reduce Chrome load.\n\
+         - Re-run with `--verbose` to see the per-step failure point.\n\
+         - If the site is behind a WAF (Cloudflare, Akamai), no headless \
+           workaround will succeed — agent rebuild must rely on prior \
+           bundles or manual inspection.\n\n\
+         **Error captured at exit:**\n\n```\n{error_message}\n```\n"
+    );
+    let path = output_dir.join("index.md");
+    let _ = std::fs::write(path, body);
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+async fn main() -> anyhow::Result<()> {
+    let mut args = Args::parse();
+
+    // --test-run reroutes output to test_runs/<host>/ unless the user passed
+    // a custom --output path. Comparison is against the literal default so
+    // "user explicitly set output" is the meaningful escape hatch.
+    if args.test_run && args.output == "output/scraped.json" {
+        let host_slug = url_to_host_slug(&args.url);
+        args.output = format!("test_runs/{host_slug}/scraped.json");
+    }
+
+    // Initialise tracing. Level: --quiet → warn, --verbose → debug, else info.
+    // Honour RUST_LOG if set so power-users can target specific modules.
+    let level_filter = if args.quiet {
+        "warn"
+    } else if args.verbose {
+        "debug"
+    } else {
+        "info"
+    };
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level_filter));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .without_time()
+        .with_writer(std::io::stderr)
+        .init();
+
+    // Pre-create the output directory immediately, BEFORE any Chrome /
+    // network activity. Round L regression: Martinus.cz crashed during
+    // sitemap fetch (headless_chrome transport timeout) and never reached
+    // the normal create_dir_all step, leaving the user with zero output
+    // files and no idea what went wrong. Now: dir exists + a placeholder
+    // index.md is written immediately; the real index.md overwrites it on
+    // success, but if the run crashes mid-flight the placeholder stays so
+    // the user sees an explicit "scrape did not complete" message rather
+    // than an empty / missing folder.
+    let output_path = std::path::Path::new(&args.output).to_path_buf();
+    let initial_output_dir = output_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let _ = std::fs::create_dir_all(&initial_output_dir);
+    write_crash_bundle(
+        &initial_output_dir,
+        &args.url,
+        "(scrape did not complete — check stderr for the actual error; \
+         re-run with --verbose for per-step diagnostics)",
+    );
 
     println!("🚀 Starting scraper...");
     println!("Target: {}", args.url);
     println!("Concurrency: {}", args.concurrency);
 
-    let scraper = Scraper::new(args.concurrency, args.timeout);
+    let extract_brand = !args.no_extract_brand;
+    let fetch_css = !args.no_fetch_css;
+    // Build the scraper first with no rate limit; we may set one after
+    // fetching robots.txt if Crawl-delay is present and --delay is 0.
+    let mut effective_delay_ms = args.delay;
+    let scraper = Scraper::new(
+        args.concurrency,
+        args.timeout,
+        args.js_wait,
+        args.js_wait_selector.clone(),
+        extract_brand,
+        args.no_js,
+        effective_delay_ms,
+        args.max_images_per_page,
+        args.user_agent.as_deref(),
+        &args.headers,
+    )?;
+    if args.no_js {
+        println!("⚡ --no-js mode: using plain HTTP fetch (Chrome not launched)");
+        if args.screenshots {
+            tracing::warn!(
+                "--screenshots is ignored when --no-js is set (Chrome needed for capture)"
+            );
+        }
+    }
 
-    // Determine if URL is a sitemap
-    let urls = if args.url.contains("sitemap") || args.url.ends_with(".xml") {
+    // --- Robots.txt -------------------------------------------------------
+    let robots_rules: Vec<String> = if args.ignore_robots {
+        Vec::new()
+    } else {
+        let base_url = Url::parse(&args.url).ok();
+        match base_url {
+            Some(b) => {
+                let rules = scraper.fetch_robots_rules(&b).await;
+                if !rules.disallow.is_empty() {
+                    println!(
+                        "🤖 robots.txt: {} Disallow rule(s) honoured",
+                        rules.disallow.len()
+                    );
+                }
+                if let Some(cd) = rules.crawl_delay_ms {
+                    if effective_delay_ms == 0 {
+                        println!(
+                            "⏱  robots.txt: Crawl-delay {} ms honoured (override with --delay)",
+                            cd
+                        );
+                        effective_delay_ms = cd;
+                    }
+                }
+                rules.disallow
+            }
+            None => Vec::new(),
+        }
+    };
+    // Rebuild the scraper if Crawl-delay raised our effective delay.
+    let scraper = if effective_delay_ms != args.delay {
+        Scraper::new(
+            args.concurrency,
+            args.timeout,
+            args.js_wait,
+            args.js_wait_selector.clone(),
+            extract_brand,
+            args.no_js,
+            effective_delay_ms,
+            args.max_images_per_page,
+            args.user_agent.as_deref(),
+            &args.headers,
+        )?
+    } else {
+        scraper
+    };
+    let excludes = build_exclude_patterns(&args);
+    let include_patterns = build_include_patterns(&args);
+    if !excludes.is_empty() {
+        println!("🚫 URL excludes: {} patterns active", excludes.len());
+    }
+    if !include_patterns.is_empty() {
+        println!("✅ URL includes: {} patterns active", include_patterns.len());
+    }
+
+    let raw_urls = if args.url.contains("sitemap") || args.url.ends_with(".xml") {
         println!("📋 Parsing sitemap...");
         scraper.fetch_sitemap(&args.url).await?
     } else {
-        // Try to find sitemap automatically
-        let base_url = Url::parse(&args.url)?;
-        let sitemap_url = format!(
-            "{}://{}/sitemap.xml",
-            base_url.scheme(),
-            base_url.host_str().unwrap()
-        );
+        let base_url = Url::parse(&args.url).context("invalid target URL")?;
+        let host = base_url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("URL has no host component"))?;
+        let sitemap_url = format!("{}://{}/sitemap.xml", base_url.scheme(), host);
 
-        println!("🔍 Looking for sitemap at: {}", sitemap_url);
+        println!("🔍 Looking for sitemap at: {sitemap_url}");
         match scraper.fetch_sitemap(&sitemap_url).await {
-            Ok(urls) if !urls.is_empty() && urls.len() > 1 => {
+            Ok(urls) if urls.len() > 1 => {
                 println!("✓ Found sitemap with {} URLs", urls.len());
                 urls
             }
             _ => {
                 println!("⚠️  No sitemap found, starting crawler...");
+                if args.crawl_with_http {
+                    println!("⚡ --crawl-with-http: link discovery uses plain HTTP");
+                }
                 scraper
-                    .crawl(&args.url, args.max_depth, args.max_pages)
+                    .crawl(
+                        &args.url,
+                        args.max_depth,
+                        args.max_pages,
+                        &excludes,
+                        args.crawl_with_http,
+                    )
                     .await
             }
         }
     };
 
-    let total = urls.len();
-    println!("📊 Found {} URLs to scrape", total);
+    // Cross-domain sitemap detection. Some merged / acquired companies
+    // (damejidlo.cz → foodora.cz) leave a sitemap.xml that points 100%
+    // at the new host. The bundle ends up named after the OLD domain but
+    // contains URLs for a different site. Warn the user + record a
+    // quality_warning so the agent doesn't blindly trust the bundle name.
+    let target_host = Url::parse(&args.url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_string()));
+    let mut cross_domain_warning: Option<String> = None;
+    if let Some(ref host) = target_host {
+        let cross: usize = raw_urls
+            .iter()
+            .filter_map(|u| Url::parse(u).ok())
+            .filter(|u| {
+                u.host_str()
+                    .map(|h| {
+                        let h = h.trim_start_matches("www.");
+                        !h.eq_ignore_ascii_case(host) && !h.ends_with(&format!(".{host}"))
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        if !raw_urls.is_empty() {
+            let pct = (cross as f64 / raw_urls.len() as f64 * 100.0).round() as u32;
+            if pct >= 50 {
+                // Identify the dominant foreign host for the warning message.
+                let mut host_counts: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for u in &raw_urls {
+                    if let Some(h) = Url::parse(u).ok().and_then(|p| p.host_str().map(str::to_lowercase)) {
+                        *host_counts.entry(h.trim_start_matches("www.").to_string()).or_default() += 1;
+                    }
+                }
+                let foreign_top = host_counts
+                    .iter()
+                    .filter(|(h, _)| !h.eq_ignore_ascii_case(host))
+                    .max_by_key(|(_, c)| **c)
+                    .map(|(h, _)| h.clone())
+                    .unwrap_or_default();
+                println!(
+                    "🌐 Cross-domain sitemap: {pct}% of URLs point at {foreign_top} (target host = {host}). The bundle name reflects the input URL but the content is from a different domain — likely a merger/redirect."
+                );
+                cross_domain_warning = Some(format!(
+                    "cross_domain_sitemap:{pct}%_urls_at_{foreign_top}"
+                ));
+            }
+        }
+    }
 
-    // Create output directories
+    // Apply the --max-pages cap to sitemap mode too. Crawler mode already
+    // caps internally, but sitemap mode used to scrape every URL the
+    // sitemap returned, which made --max-pages a footgun.
+    //
+    // BEFORE truncating, sort by `url_priority` so the chrome pages an
+    // agent needs most (home → contact → about → legal) survive the cap.
+    // Shopify and similar e-commerce sitemaps put products first and
+    // contact last; without this sort, /contact gets dropped at small
+    // caps, losing the agent its primary lead-capture target.
+    let raw_urls = if raw_urls.len() > args.max_pages {
+        let dropped = raw_urls.len() - args.max_pages;
+        println!(
+            "📦 Capping {} sitemap URLs to --max-pages={} (drop {} URLs, prioritising home/contact/about/legal)",
+            raw_urls.len(),
+            args.max_pages,
+            dropped
+        );
+        let mut sorted = raw_urls;
+        sorted.sort_by_key(|u| url_priority(u));
+        sorted.into_iter().take(args.max_pages).collect()
+    } else {
+        raw_urls
+    };
+
+    let total_before_filter = raw_urls.len();
+    // Canonicalise + dedupe BEFORE filtering, so `/page` and `/page/` are
+    // treated as the same URL and we don't scrape both.
+    let canonical: Vec<String> = raw_urls.into_iter().map(|u| canonicalize_url(&u)).collect();
+    let mut seen_canon: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut urls: Vec<String> = canonical
+        .into_iter()
+        .filter(|u| seen_canon.insert(u.clone()))
+        .filter(|u| !url_matches_excludes(u, &excludes))
+        .filter(|u| url_matches_includes(u, &include_patterns))
+        .collect();
+    if urls.len() != total_before_filter {
+        println!(
+            "🧹 Filtered {} URLs (canonicalisation + exclude/include)",
+            total_before_filter - urls.len()
+        );
+    }
+    if !robots_rules.is_empty() {
+        let before = urls.len();
+        urls.retain(|u| !is_disallowed_by_robots(u, &robots_rules));
+        if urls.len() != before {
+            println!(
+                "🤖 Filtered {} URLs disallowed by robots.txt",
+                before - urls.len()
+            );
+        }
+    }
+
+    let total = urls.len();
+    println!("📊 Found {total} URLs to scrape");
+
     let output_path = std::path::Path::new(&args.output);
     let output_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
     let images_dir = output_dir.join("images");
-
     std::fs::create_dir_all(output_dir)?;
     std::fs::create_dir_all(&images_dir)?;
+    let images_dir_str = normalize_path(&images_dir.to_string_lossy());
 
-    let images_dir_str = images_dir.to_string_lossy().to_string();
+    let (mut pages, skipped_pages) = scraper.scrape_all(urls, images_dir_str.clone()).await;
 
-    let pages = scraper.scrape_all(urls, images_dir_str).await;
+    // --- Per-page derived data: sections / quality / assets / hash / summary ---
+    for page in pages.iter_mut() {
+        page.sections = detect_sections(&page.content_blocks);
+        page.quality_flags = detect_quality_flags(page);
+
+        // Content hash — first 16 hex chars of SHA-256(plain_text). Lets the
+        // agent dedup boilerplate across pages and detect change vs prior run.
+        if !page.plain_text.is_empty() {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(page.plain_text.as_bytes());
+            let hex = format!("{:x}", hasher.finalize());
+            page.content_hash = hex[..16].to_string();
+        }
+
+        // Rough token estimate (~4 chars / token).
+        page.token_estimate = page.plain_text.chars().count() / 4;
+
+        // One-line summary: meta_description > first paragraph > first heading.
+        page.summary = if !page.meta_description.is_empty() {
+            page.meta_description
+                .chars()
+                .take(200)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        } else {
+            let first_p = page.content_blocks.iter().find_map(|b| match b {
+                crate::model::ContentBlock::Paragraph { text } => Some(text.as_str()),
+                _ => None,
+            });
+            let first_h = page.content_blocks.iter().find_map(|b| match b {
+                crate::model::ContentBlock::Heading { text, .. } => Some(text.as_str()),
+                _ => None,
+            });
+            first_p
+                .or(first_h)
+                .map(|s| s.chars().take(200).collect::<String>().trim().to_string())
+                .unwrap_or_default()
+        };
+
+        let mut assets: Vec<String> = page
+            .content_blocks
+            .iter()
+            .filter_map(|b| match b {
+                crate::model::ContentBlock::Image { local_path, .. } if !local_path.is_empty() => {
+                    Some(local_path.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if let Some(og) = &page.og_image_local_path {
+            assets.push(og.clone());
+        }
+        assets.sort();
+        assets.dedup();
+        page.page_assets = assets;
+    }
+
+    // --- Download og:image per page (deduplicated) -----------------------
+    let unique_og_urls: std::collections::HashSet<String> = pages
+        .iter()
+        .filter_map(|p| p.og_image_url.clone())
+        .collect();
+    if !unique_og_urls.is_empty() {
+        let mut og_url_to_path: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for og_url in &unique_og_urls {
+            if let Some(path) = download_image(&scraper.client, og_url, &images_dir_str).await {
+                og_url_to_path.insert(og_url.clone(), path);
+            }
+        }
+        for page in pages.iter_mut() {
+            if let Some(og_url) = &page.og_image_url {
+                if let Some(path) = og_url_to_path.get(og_url) {
+                    page.og_image_local_path = Some(path.clone());
+                }
+            }
+        }
+    }
+
+    // --- Screenshots (optional, requires Chrome) -------------------------
+    if args.screenshots && !pages.is_empty() {
+        if let Some(browser) = scraper.browser.as_ref() {
+            let screenshots_dir = output_dir.join("screenshots");
+            std::fs::create_dir_all(&screenshots_dir)?;
+            let concurrency = args.concurrency.max(2);
+            println!(
+                "📸 Capturing screenshots ({} pages, concurrency={})...",
+                pages.len(),
+                concurrency
+            );
+
+            let jobs: Vec<(String, String, String)> = pages
+                .iter()
+                .map(|p| {
+                    let slug = url_to_slug(&p.url);
+                    let d = screenshots_dir
+                        .join(format!("{slug}.desktop.png"))
+                        .to_string_lossy()
+                        .to_string();
+                    let m = screenshots_dir
+                        .join(format!("{slug}.mobile.png"))
+                        .to_string_lossy()
+                        .to_string();
+                    (p.url.clone(), d, m)
+                })
+                .collect();
+
+            let js_wait_ms = scraper.js_wait_ms;
+            let wait_selector = scraper.js_wait_selector.clone();
+
+            use futures::stream::{self, StreamExt};
+            let results: Vec<(String, Option<String>, Option<String>)> = stream::iter(jobs)
+                .map(|(url, dpath, mpath)| {
+                    let browser = Arc::clone(browser);
+                    let wait_sel = wait_selector.clone();
+                    async move {
+                        let url_d = url.clone();
+                        let bd = Arc::clone(&browser);
+                        let wsd = wait_sel.clone();
+                        let desktop = tokio::task::spawn_blocking(move || {
+                            capture_screenshot(
+                                &bd,
+                                &url_d,
+                                js_wait_ms,
+                                wsd.as_deref(),
+                                1280,
+                                800,
+                                &dpath,
+                            )
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+
+                        let url_m = url.clone();
+                        let bm = browser;
+                        let wsm = wait_sel;
+                        let mobile = tokio::task::spawn_blocking(move || {
+                            capture_screenshot(
+                                &bm,
+                                &url_m,
+                                js_wait_ms,
+                                wsm.as_deref(),
+                                390,
+                                844,
+                                &mpath,
+                            )
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+
+                        (url, desktop, mobile)
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+
+            let mut url_to_paths: std::collections::HashMap<
+                String,
+                (Option<String>, Option<String>),
+            > = results.into_iter().map(|(u, d, m)| (u, (d, m))).collect();
+            for page in pages.iter_mut() {
+                if let Some((d, m)) = url_to_paths.remove(&page.url) {
+                    page.screenshot_desktop = d;
+                    page.screenshot_mobile = m;
+                }
+            }
+        }
+    }
+
+    // --- 404 capture (optional) ------------------------------------------
+    let mut error_pages: Vec<crate::model::PageData> = Vec::new();
+    if args.capture_404 {
+        if let Ok(base) = Url::parse(&args.url) {
+            let probe_token = format!(
+                "{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            let probe_url = format!(
+                "{}://{}/dump-it-probe-{}",
+                base.scheme(),
+                base.host_str().unwrap_or(""),
+                &probe_token[..probe_token.len().min(12)]
+            );
+            println!("🔎 Probing 404 template at {probe_url}");
+            if let Some(mut p) = scraper.scrape_page(probe_url, &images_dir_str).await {
+                // Re-derive sections / quality flags so the 404 page has them too.
+                p.sections = detect_sections(&p.content_blocks);
+                p.quality_flags = detect_quality_flags(&p);
+                error_pages.push(p);
+            } else {
+                tracing::warn!("404 probe failed (no body returned)");
+            }
+        }
+    }
 
     let result = ScrapedData {
         total_pages: pages.len(),
         pages,
     };
 
-    // Write to file
+    // --- Build site-wide aggregate ---
+    let mut site_data = build_site_data(&result.pages, &args.url);
+
+    // --- Template-page grouping --------------------------------------------
+    site_data.templates = detect_templates(&result.pages);
+
+    // --- Bundle-level quality warnings ------------------------------------
+    // SPA loading-shell detection: when >=80% of pages share the same
+    // tiny template, the JS hadn't hydrated when we snapshotted.
+    site_data
+        .quality_warnings
+        .extend(detect_quality_warnings(&result.pages, &site_data.templates));
+    // Cross-domain sitemap (damejidlo → foodora style).
+    if let Some(w) = cross_domain_warning {
+        site_data.quality_warnings.push(w);
+    }
+
+    // --- Skipped pages (render-failed / bot-protected) --------------------
+    site_data.skipped_pages = skipped_pages;
+    if !site_data.skipped_pages.is_empty() {
+        let total_attempted = site_data.total_pages + site_data.skipped_pages.len();
+        let pct = (site_data.skipped_pages.len() as f64 / total_attempted as f64 * 100.0)
+            .round() as u32;
+        if pct >= 50 {
+            site_data
+                .quality_warnings
+                .push(format!("partial_scrape:{pct}%_pages_skipped"));
+        }
+    }
+
+    // --- Hreflang locale clusters -----------------------------------------
+    site_data.hreflang_groups = build_hreflang_groups(&result.pages);
+
+    // --- 404 / error pages ------------------------------------------------
+    site_data.error_pages = error_pages;
+
+    // --- Framework detection from the first page's body ------------------
+    // We don't keep page HTML around — detect by reading style_text + URL
+    // hints aggregated across all pages. Approximate but cheap.
+    let combined_signature: String = result
+        .pages
+        .iter()
+        .take(3)
+        .flat_map(|p| {
+            p.stylesheet_urls
+                .iter()
+                .chain(p.internal_links_out.iter())
+                .cloned()
+        })
+        .chain(result.pages.iter().take(3).map(|p| p.style_text.clone()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    site_data.frameworks = detect_frameworks_from_html(&combined_signature);
+
+    // --- Download favicon + logo ----------------------------------------
+    if let Some(fav_url) = site_data.brand.favicon_url.clone() {
+        if let Some(path) =
+            download_asset(&scraper.client, &fav_url, &images_dir_str, "favicon").await
+        {
+            site_data.brand.favicon_local_path = Some(path);
+        }
+    }
+    if let Some(logo_url) = site_data.brand.logo_url.clone() {
+        if !logo_url.starts_with("inline-svg://") {
+            if let Some(path) =
+                download_asset(&scraper.client, &logo_url, &images_dir_str, "logo").await
+            {
+                site_data.brand.logo_local_path = Some(path);
+            }
+        }
+    }
+
+    // --- Aggregate contact info ----------------------------------------
+    site_data.contact = aggregate_contact(&result.pages);
+
+    // --- Brand palette + external CSS ----------------------------------
+    if extract_brand {
+        let all_sheet_urls: Vec<String> = result
+            .pages
+            .iter()
+            .flat_map(|p| p.stylesheet_urls.iter().cloned())
+            .collect();
+        let mut deduped_sheets: Vec<String> = all_sheet_urls.clone();
+        deduped_sheets.sort();
+        deduped_sheets.dedup();
+
+        let external_css = if fetch_css && !deduped_sheets.is_empty() {
+            println!(
+                "🎨 Fetching {} external stylesheets for brand mining...",
+                deduped_sheets.len().min(20)
+            );
+            fetch_external_css(&scraper.client, &deduped_sheets).await
+        } else {
+            String::new()
+        };
+
+        let (mut colors, fonts, css_vars) =
+            aggregate_brand_palette(&result.pages, &external_css, 12);
+        // Fallback: if the CSS scan produced fewer than 3 useful colors,
+        // try to extract dominant colors from the logo (or favicon) image bytes.
+        if colors.len() < 3 {
+            let candidate = site_data
+                .brand
+                .logo_local_path
+                .as_ref()
+                .or(site_data.brand.favicon_local_path.as_ref());
+            if let Some(p) = candidate {
+                let from_img = dominant_colors_from_image(std::path::Path::new(p), 6);
+                if !from_img.is_empty() {
+                    println!(
+                        "🎨 CSS palette thin ({}); adding {} colour(s) from {p}",
+                        colors.len(),
+                        from_img.len()
+                    );
+                    // Append without exceeding top-12.
+                    for c in from_img {
+                        if colors.iter().all(|existing| existing.value != c.value) {
+                            colors.push(c);
+                        }
+                    }
+                    colors.truncate(12);
+                }
+            }
+        }
+        site_data.brand.colors = colors;
+        let webfont_urls = detect_webfont_urls(&deduped_sheets);
+        // Boost fonts that show up in webfont URLs (Google Fonts / Bunny /
+        // Adobe) — these are loaded even when CSS only references them via
+        // `var(--font-sans)`. Without this, Plausible / Next.js / Tailwind
+        // sites end up with a near-empty fonts list.
+        let mut fonts = fonts;
+        merge_webfont_families(&mut fonts, &webfont_urls, 12);
+        // Brand confidence — Next.js / CSS-in-JS sites mask their styling
+        // from a static scan. We require BOTH dimensions to register
+        // meaningful counts before claiming confidence; Schoolhouse with
+        // color = 10× but font = 1× is genuinely thin and should be
+        // `low`. Cuts:
+        //   high   = max ≥ 30 AND min ≥ 5
+        //   medium = max ≥ 10 AND min ≥ 3
+        //   low    = otherwise
+        let top_color_count = site_data.brand.colors.first().map(|c| c.count).unwrap_or(0);
+        let top_font_count = fonts.first().map(|f| f.count).unwrap_or(0);
+        let max_count = top_color_count.max(top_font_count);
+        let min_count = top_color_count.min(top_font_count);
+        let confidence = if max_count >= 30 && min_count >= 5 {
+            "high"
+        } else if max_count >= 10 && min_count >= 3 {
+            "medium"
+        } else {
+            "low"
+        };
+        site_data.brand.confidence = Some(confidence.to_string());
+        site_data.brand.fonts = fonts;
+        site_data.brand.css_variables = css_vars;
+        site_data.brand.webfont_urls = webfont_urls;
+    }
+
+    // --- Emit master scraped.json ---------------------------------------
     let json = serde_json::to_string_pretty(&result)?;
     std::fs::write(&args.output, json)?;
+    site_data.output_files.push(
+        std::path::Path::new(&args.output)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| args.output.clone()),
+    );
 
-    println!("✅ Done! Scraped {}/{} pages", result.total_pages, total);
+    // --- Optional: streaming JSONL --------------------------------------
+    if args.jsonl {
+        let jsonl_path = output_dir.join("scraped.jsonl");
+        let mut buf = String::with_capacity(result.pages.len() * 1024);
+        for page in &result.pages {
+            buf.push_str(&serde_json::to_string(&page)?);
+            buf.push('\n');
+        }
+        std::fs::write(&jsonl_path, buf)?;
+        site_data.output_files.push("scraped.jsonl".to_string());
+    }
+
+    // --- Optional: split per-page JSON ----------------------------------
+    if args.split_pages {
+        let pages_dir = output_dir.join("pages");
+        std::fs::create_dir_all(&pages_dir)?;
+        for (i, page) in result.pages.iter().enumerate() {
+            let slug = url_to_slug(&page.url);
+            let filename = format!("{slug}.json");
+            let page_path = pages_dir.join(&filename);
+            let page_json = serde_json::to_string_pretty(&page)?;
+            std::fs::write(&page_path, page_json)?;
+            if let Some(s) = site_data.sitemap.get_mut(i) {
+                s.file = Some(format!("pages/{filename}"));
+            }
+        }
+        site_data.output_files.push("pages/".to_string());
+    }
+
+    // --- Optional: Markdown export per page -----------------------------
+    if args.markdown {
+        let md_dir = output_dir.join("markdown");
+        std::fs::create_dir_all(&md_dir)?;
+        for (i, page) in result.pages.iter().enumerate() {
+            let slug = url_to_slug(&page.url);
+            let md_path = md_dir.join(format!("{slug}.md"));
+            std::fs::write(&md_path, page_to_markdown(page))?;
+            if let Some(s) = site_data.sitemap.get_mut(i) {
+                s.markdown_file = Some(format!("markdown/{slug}.md"));
+            }
+        }
+        site_data.output_files.push("markdown/".to_string());
+    }
+
+    // --- Emit contact.json + brand.json ----------------------------------
+    let contact_path = output_dir.join("contact.json");
+    std::fs::write(
+        &contact_path,
+        serde_json::to_string_pretty(&site_data.contact)?,
+    )?;
+    site_data.output_files.push("contact.json".to_string());
+    if extract_brand {
+        let brand_path = output_dir.join("brand.json");
+        std::fs::write(&brand_path, serde_json::to_string_pretty(&site_data.brand)?)?;
+        site_data.output_files.push("brand.json".to_string());
+    }
+
+    // --- Asset manifest --------------------------------------------------
+    site_data.assets = build_asset_manifest(output_dir);
+
+    // --- compact.json ----------------------------------------------------
+    let compact = build_compact(&site_data, &result);
+    let compact_path = output_dir.join("compact.json");
+    std::fs::write(&compact_path, serde_json::to_string_pretty(&compact)?)?;
+    site_data.output_files.push("compact.json".to_string());
+
+    // --- schema.json (describes the bundle shape) -----------------------
+    let schema_path = output_dir.join("schema.json");
+    std::fs::write(
+        &schema_path,
+        serde_json::to_string_pretty(&build_schema_json())?,
+    )?;
+    site_data.output_files.push("schema.json".to_string());
+
+    // --- Emit site.json + index.md (these reference output_files, so last) ---
+    let site_path = output_dir.join("site.json");
+    std::fs::write(&site_path, serde_json::to_string_pretty(&site_data)?)?;
+    site_data.output_files.push("site.json".to_string());
+
+    let index_path = output_dir.join("index.md");
+    let index_md = build_index_md(&site_data, &result.pages);
+    std::fs::write(&index_path, index_md)?;
+
+    let failed = total.saturating_sub(result.total_pages);
+    if failed > 0 {
+        println!(
+            "✅ Done! Scraped {}/{} pages (✗ {failed} failed — check stderr for warnings)",
+            result.total_pages, total
+        );
+    } else {
+        println!("✅ Done! Scraped {}/{} pages", result.total_pages, total);
+    }
     println!("💾 Output saved to: {}", args.output);
+    println!("📄 Site summary: {}", site_path.display());
+    println!("📑 Index: {}", index_path.display());
+    println!("📞 Contact: {}", contact_path.display());
+    if extract_brand {
+        println!("🎨 Brand: {}", output_dir.join("brand.json").display());
+    }
+    println!("📦 Compact: {}", compact_path.display());
+    if args.split_pages {
+        println!("📂 Per-page files: {}", output_dir.join("pages").display());
+    }
+    if args.markdown {
+        println!("📝 Markdown: {}", output_dir.join("markdown").display());
+    }
+    if args.screenshots {
+        println!(
+            "📸 Screenshots: {}",
+            output_dir.join("screenshots").display()
+        );
+    }
 
     Ok(())
 }
